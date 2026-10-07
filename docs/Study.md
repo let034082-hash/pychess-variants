@@ -310,6 +310,13 @@ move tokens remain import errors rather than being silently skipped.
 [studyPgnImport.ts](../client/study/studyPgnImport.ts) defines the parser-neutral recursive
 PGN contract and converts parsed games into Study trees. It preserves variations,
 comments, NAGs, shapes, clocks, evaluations, and the supported PyChess extensions.
+The browser's ffish.js replay is also authoritative for bulk-import chess semantics:
+move legality, node FEN/SAN/check data, and side to move are derived client-side instead
+of replaying the complete tree again with pyffish on the production aiohttp event loop.
+The server still validates the root position and enforces structural/resource invariants,
+including node limits, IDs/parents/cycles/order, bounded node FENs and FEN/turn
+consistency, and authenticated comment authorship. Interactive single-move Study edits
+continue to receive server-side engine validation.
 When an imported PGN contains `[Orientation "white"]` or `[Orientation "black"]`, that
 choice is preserved exactly. Lichess omits this tag from its default Study export, so in its
 absence the importer applies the useful parts of Lichess's automatic orientation rules.
@@ -450,8 +457,8 @@ keep this schema-preserving server deployed and narrow the production variable (
 example to `normal`) rather than deploying code from before analysis-mode support. No
 eager migration/backfill is required.
 
-Untrusted embedded rules and their imported positions/trees are validated outside
-the serving process. Historical rules admitted to the main native engine registry
+Untrusted embedded rules and their imported root position are validated outside
+the serving process before bulk tree data is accepted. Historical rules admitted to the main native engine registry
 have a separate configurable cap of 256 snapshots per process. Native registrations
 cannot be unloaded; the budget resets on restart. This bound is a resource policy,
 not a production memory measurement.

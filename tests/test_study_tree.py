@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import patch
 
 from study.annotations import StudyAnnotations, StudyComment, StudyShape
 from study.tree import (
@@ -133,6 +134,14 @@ class StudyTreeTestCase(unittest.TestCase):
         )
         self.assertEqual(payload["nodes"][0]["eval"], {"cp": 42})  # type: ignore[index]
         self.assertEqual(StudyTree.from_payload(payload), tree)
+
+    def test_payload_rejects_node_limit_before_parsing_nodes(self) -> None:
+        payload = {"nodes": [{}, {}]}
+        with (
+            patch("study.tree.STUDY_MAX_NODES_PER_CHAPTER", 1),
+            self.assertRaisesRegex(ValueError, "maximum is 1"),
+        ):
+            StudyTree.from_payload(payload)
 
     def test_gamebook_text_uses_comment_sanitization_and_empty_values_remove_fields(self) -> None:
         gamebook = StudyGamebook(hint="  hello\x00 world  ", deviation="   ")

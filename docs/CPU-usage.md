@@ -1,0 +1,312 @@
+# Server CPU usage and event-loop latency audit
+
+PyChess production runs on a resource-constrained Heroku dyno while serving many
+simultaneous real-time games. Very short time controls make latency especially
+important: a CPU-heavy synchronous operation in the aiohttp process does not only
+make its own request slow; it can prevent unrelated WebSocket games from being
+scheduled while the operation is running.
+
+This document records the initial server-side CPU/event-loop audit performed on
+2026-10-07. It is intentionally an audit baseline rather than an implementation
+plan. Each finding should be discussed before deciding how to change it.
+
+## What matters most
+
+The main risk is **uninterrupted synchronous work on the aiohttp event-loop
+thread**. A function can be relatively rare and still be dangerous if one
+invocation monopolizes the event loop for hundreds of milliseconds or seconds.
+Conversely, a small synchronous cost may be important when it occurs on every
+move in every live game.
+
+The initial priorities are:
+
+| Priority | Area | Main concern |
+| --- | --- | --- |
+| P0 | Study tree validation | Large user-supplied trees can monopolize the event loop for seconds; history-dependent variants are especially expensive |
+| P0 | Historical game reconstruction | Replaying a complete game synchronously can cause second-scale stalls after cache misses/restarts |
+| P0/P1 | Full `/metrics` snapshot | Explicit GC and Python heap traversal run synchronously in the server process |
+| P1 | Ordinary live move processing | Several Fairy-Stockfish calls run synchronously for every move |
+| P1 | Bughouse live move processing | Similar per-move engine work, with both boards participating in status calculations |
+| P2 | Other Study whole-tree/document operations | Repeated scans, BSON encoding, and snapshot hashing add avoidable latency |
+| P2 | Tournament pairing and other occasional CPU work | Rare CPU-heavy algorithms should not unexpectedly block live games |
+
+The absolute timings below were measured in a development/test environment, not
+on the production Heroku dyno. They should therefore be treated as indicators of
+relative cost and event-loop risk, not as production benchmarks. The important
+fact is that the measured work is synchronous and does not yield to aiohttp.
+
+## 1. Study tree validation — P0
+
+The largest observed one-shot risk is Study import/tree validation in
+`server/study/builder.py`, especially `_validated_tree()` around line 467.
+
+For each submitted node, validation performs several synchronous board/engine
+operations, including legal-move generation, SAN generation, move application,
+and check detection. The configured chapter limit is currently 3,000 nodes in
+`server/study/constants.py`.
+
+A linear orthodox-chess tree measured approximately:
+
+- 100 nodes: 0.72 s
+- 200 nodes: 1.43 s
+- 400 nodes: 2.99 s
+
+Those seconds are uninterrupted server-side CPU work from the point of view of
+the event loop.
+
+### History-dependent variants are substantially worse
+
+For variants whose legal moves require history, including Janggi, Ataxx, and
+applicable custom variants, validation reconstructs the board from the initial
+position and replays preceding moves while validating nodes. A linear chapter
+therefore repeats more and more historical work as it advances.
+
+Measured Janggi validation cost was approximately:
+
+- 10 nodes: 0.135 s
+- 20 nodes: 0.416 s
+- 40 nodes: 1.46 s
+- 80 nodes: 5.34 s
+
+This growth is consistent with effectively quadratic replay work for a linear
+history-dependent chapter. A legal user-supplied import can therefore become a
+major event-loop stall long before reaching the general 3,000-node limit.
+
+### Tree traversal also contains repeated linear scans
+
+`StudyTree.children_of()` in `server/study/tree.py` scans the node collection to
+find a node's children. Algorithms that call it repeatedly while walking a tree,
+such as preferred-mainline construction, can therefore introduce O(N^2)
+Python-level work independently of engine replay.
+
+`preferred_mainline()` measured roughly:
+
+- 1,000 nodes: 26 ms
+- 2,000 nodes: 107 ms
+- 3,000 nodes: 263 ms
+
+This is much smaller than history-dependent engine replay, but it is still
+avoidable synchronous work and compounds other Study costs.
+
+### Resolution: move bulk chess-semantic validation to the browser
+
+The expensive part of this finding was addressed after review on 2026-10-07.
+PyChess already uses the same Fairy-Stockfish rules on both sides through
+`ffish.js` in the browser and `pyffish` on the server, and PGN import already
+replayed every branch client-side. Replaying the complete tree again on the
+resource-constrained production server duplicated the expensive work.
+
+Bulk Study creation/import now uses the following trust boundary:
+
+- the browser owns move legality, variation replay, derived node FEN, SAN, check
+  state, and side-to-move normalization;
+- the server still validates the initial position;
+- the server still enforces cheap structural/resource invariants such as node
+  limits, IDs, parents, cycles, sibling order, annotation/value limits, bounded
+  node FENs, and node FEN/turn consistency;
+- authenticated comment authorship remains server-authoritative;
+- embedded custom-variant INI plus the imported root FEN are still validated in
+  an isolated pyffish child process before an accepted immutable snapshot can
+  reach the long-lived server process;
+- interactive one-move Study mutations continue to validate the newly-added move
+  server-side.
+
+The full-tree `_validated_tree()` engine replay was removed from the bulk
+`from_analysis()` / PGN-import path. A synthetic linear tree measured after the
+change (including `StudyTree.from_payload()` structural validation and comment
+author canonicalization) at approximately:
+
+- 100 nodes: 1.5-1.6 ms
+- 400 nodes: 5.6-5.8 ms
+- 1,000 nodes: 14-15 ms
+- 3,000 nodes: 45-50 ms
+
+These are development/sandbox numbers, not Heroku guarantees, but the important
+change is algorithmic: bulk creation no longer makes per-node Fairy-Stockfish
+calls or repeatedly reconstructs move history on the aiohttp event-loop thread.
+The Janggi/Ataxx quadratic replay case is therefore eliminated from this path.
+
+The separate `StudyTree.children_of()` / `preferred_mainline()` repeated-scan
+issue remains open and should be discussed independently; it is no longer
+compounded by bulk engine replay.
+
+## 2. Historical game reconstruction — P0
+
+`Game.get_board()` in `server/game.py` can call synchronous `create_steps()` when
+a loaded game has moves but its derived step list has not yet been reconstructed.
+`create_steps()` replays the game from the beginning and performs SAN generation,
+move application/FEN reconstruction, and status/check work for every ply.
+
+Approximate measured core replay cost was:
+
+- 20 plies: 84 ms
+- 100 plies: 420 ms
+- 200 plies: 880 ms
+- 400 plies: 1.66 s
+- 800 plies: 3.43 s
+
+The risk is particularly relevant after dyno restart, cache eviction, or other
+situations where several historical/live games need reconstruction at nearly the
+same time.
+
+Bughouse reconstruction in `server/bug/utils_bug.py` is heavier because it must
+rebuild two related boards and pocket state. Equivalent engine work was roughly
+5.7-6.2 ms per ply in the audit, around 1.1 s for 200 plies.
+
+### Points to discuss before implementation
+
+Potential approaches include persisting enough derived state to avoid complete
+replay for common reconnect/load cases, making expensive reconstruction lazy,
+and making unavoidable long reconstruction cooperative by yielding between
+small batches. Cooperative replay still consumes CPU, but it prevents a
+multi-second uninterrupted global pause.
+
+## 3. Full `/metrics` snapshot — P0/P1
+
+The full metrics handler in `server/server_metrics.py` performs intentionally
+expensive diagnostic work synchronously inside an async request handler.
+
+`memory_stats()` includes work such as:
+
+- `gc.collect()`;
+- enumerating GC-tracked Python objects;
+- recursively estimating deep object sizes;
+- aggregating/sorting object information.
+
+The full handler then also gathers/sorts live application structures such as
+users, games, seeks, and asyncio tasks. The source itself notes that the memory
+snapshot is suitable for executor/off-thread work, but the current request path
+calls it directly.
+
+Even in a mostly idle test process, `memory_stats()` took around 140 ms. A
+production process containing many games, users, sockets, tasks, studies, and
+cached objects has a substantially larger heap. Opening or polling the detailed
+monitor can therefore create a visible site-wide scheduler pause.
+
+The lightweight summary path does not have the same concern and should remain the
+normal monitoring path.
+
+### Points to discuss before implementation
+
+The detailed snapshot could be serialized so only one may run at a time, moved
+off the event-loop thread, and cached for an appropriate period. Forced GC should
+not be part of a frequently polled production path unless there is a strong
+reason for it.
+
+## 4. Ordinary live move processing — P1
+
+The highest-frequency synchronous cost is the normal human move path in
+`server/utils.py` and `server/game.py`.
+
+A submitted move involves multiple separate Fairy-Stockfish/pyffish operations,
+including legal-move validation, SAN generation, pushing the move/FEN creation,
+new legal-move generation, check detection, insufficient-material detection, and
+optional game-end evaluation.
+
+The audit measured an ordinary move's synchronous native-engine sequence at
+roughly 10-13 ms on the test machine. Individual wrapper operations were commonly
+around 1.3-1.5 ms.
+
+Ten milliseconds is not a major pause by itself, but this code runs continually
+across all real-time games. For example, 30 moves arriving in one second at an
+average of 10-13 ms of synchronous processing represents roughly 300-390 ms of
+that second spent in move-related synchronous engine work before accounting for
+other Python, database, serialization, and WebSocket activity.
+
+Long histories can make some status operations more expensive because historical
+move data is supplied to the engine. History-dependent variants deserve special
+attention here as well.
+
+### Points to discuss before implementation
+
+This path should be optimized differently from rare long jobs. Offloading each
+individual move may add scheduling/serialization overhead and could make latency
+worse. A more promising direction is to identify duplicate engine queries and,
+where possible, obtain several pieces of post-move information from one native
+operation instead of repeatedly parsing/reconstructing essentially the same
+position.
+
+Random-Mover also has an obvious small duplication where availability of a legal
+move can be checked immediately before obtaining the legal-move list itself.
+
+## 5. Bughouse live move processing — P1
+
+`server/bug/game_bug.py` performs similar synchronous work for each Bughouse
+move, with additional two-board interactions. The path validates the move,
+handles transferred captured pieces/pockets, generates SAN, pushes the move,
+checks legal-move availability, and evaluates status/check state involving both
+boards.
+
+An approximation of the corresponding native-engine sequence measured around
+11.7 ms median on a fresh Bughouse position in the audit.
+
+Like ordinary move processing, the main concern is frequency rather than one
+extreme invocation: every millisecond spent here is time in which the same event
+loop cannot process unrelated games.
+
+## 6. Additional Study whole-tree/document work — P2
+
+Several other Study operations synchronously process an entire chapter or tree:
+
+- `preferred_mainline()` repeatedly depends on `children_of()` scans;
+- `server/study/mutations.py` and `server/study/storage.py` call
+  `BSON.encode(chapter.to_document())` to enforce chapter-size limits;
+- `server/study/snapshot.py` creates a snapshot token by BSON-encoding and
+  SHA-256 hashing the complete chapter document.
+
+A chapter can be several megabytes, so these are potential latency spikes even
+when they are not in the same category as history-dependent import validation.
+They should be reviewed together with the broader Study data-structure work so
+that optimizations do not simply move the cost to another operation.
+
+## 7. Tournament pairing and other occasional CPU algorithms — P2
+
+The base `Tournament.create_pairing_async()` in
+`server/tournament/tournament.py` currently calls synchronous pairing logic
+inline. Swiss pairing eventually performs Dutch pairing generation in the event
+loop.
+
+The current Swiss participant limit makes this less urgent than the findings
+above, but it is a useful example of CPU work whose name/interface suggests
+asynchronous behavior while the actual algorithm executes synchronously. Similar
+occasional algorithms should be audited with the same rule: if the runtime can
+become significant, they should not unexpectedly monopolize the gameplay event
+loop.
+
+Custom-variant validation already uses child processes, which protects the event
+loop from direct blocking. On a one-vCPU dyno, however, concurrent child-process
+validation can still compete with the web process for CPU, so concurrency limits
+also matter even when work is correctly off-process.
+
+## Production observability gap: event-loop lag
+
+Existing slow-request timing is useful, but it cannot fully answer the question
+that matters for fast games: **how long was the aiohttp event loop unable to
+schedule other work?**
+
+A request may appear slow because it awaited MongoDB without harming other games.
+Conversely, a synchronous Study import or heap scan may freeze every WebSocket
+without producing an obvious per-game slow-request trace.
+
+A small event-loop-lag watchdog would make the impact measurable in production.
+For example, periodically schedule a short sleep/timer and record the difference
+between expected and actual wake-up time, logging or counting stalls above
+thresholds such as 50 ms and 100 ms. The exact thresholds and reporting mechanism
+should be discussed before implementation.
+
+## Suggested discussion order
+
+Before writing fixes, discuss the findings in this order:
+
+1. Study validation/tree algorithms and safe limits.
+2. Historical game and Bughouse reconstruction.
+3. Full metrics/memory diagnostics.
+4. Ordinary per-move Fairy-Stockfish call count and duplication.
+5. Bughouse per-move processing.
+6. Remaining Study serialization/tree costs.
+7. Tournament/other occasional CPU algorithms.
+8. Event-loop-lag production instrumentation and how to use it to verify changes.
+
+The first three are the clearest sources of large one-shot stalls. Items 4 and 5
+are likely more important for continuous CPU utilization and jitter under normal
+bullet-game load.

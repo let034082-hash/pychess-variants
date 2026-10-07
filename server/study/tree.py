@@ -563,6 +563,10 @@ class StudyTree:
             raise TypeError("Study tree payload field 'rootGamebook' must be a mapping")
         if not isinstance(raw_nodes, Sequence) or isinstance(raw_nodes, (str, bytes)):
             raise TypeError("Study tree payload field 'nodes' must be a list")
+        if len(raw_nodes) > STUDY_MAX_NODES_PER_CHAPTER:
+            raise ValueError(
+                f"Study tree has {len(raw_nodes)} nodes, maximum is {STUDY_MAX_NODES_PER_CHAPTER}"
+            )
         nodes: dict[str, StudyTreeNode] = {}
         for raw_node in raw_nodes:
             if not isinstance(raw_node, Mapping):
