@@ -312,6 +312,9 @@ label.piece.piece15.shogi {
 label.piece.piece16.shogi {
     background-image: url('images/pieces/disguised/shogi-ally.svg');
 }
+label.piece.piece17.shogi {
+    background-image: url('images/pieces/mansindam/intl/wn.svg');
+}
 
 label.piece.piece0.kyoto {
     background-image: url('images/pieces/shogi/ctk/0KA.svg');
